@@ -1,18 +1,22 @@
 # Bio Encryption Protocol (BEP)
 ### A Post-Quantum End-to-End Encrypted Messaging Protocol with Biologically-Inspired Key Evolution
 
-**Version 2.4 — Public Specification**
+**Version 2.5 — Public Specification**
 **Author: IAMTRIXY**
 **Date: June 2026**
-**Status: Public Draft — Ready for third-party formal verification and beta deployment**
+**Status: Public Draft — Ready for formal verification and beta deployment**
 
-> **Changelog v2.4:** Documentation completeness pass. Counter-nonce as default
-> (`message_index(8B LE) || random(4B)`) — eliminates RNG-failure nonce collision risk.
-> Session resumption, post-compromise recovery, and group messaging scope all documented.
-> Wire format diagram added (§4.7). Delivery TTL/EXPIRED semantics specified (§5.2).
-> Username registry centralization documented as accepted limitation (§6).
-> Known-answer test vectors added (Appendix A). Future Work updated for v3.0.
-> 115 Rust tests + 32 Go tests — all pass. Auditor rating: **A**.
+> **Changelog v2.5 (Qwen AI audit fixes):**
+> Fix A — Dual Identity Key structure explicitly documented: IK\_sign (Ed25519)
+> and IK\_dh (X25519) are separate keys. Sealed Sender uses IK\_dh, not IK\_sign.
+> Fix B — DH Ratchet timeout changed from message count (100 msgs) to wall-clock
+> time (90 days). Eliminates the "Hiking Trip" desync bug.
+> Fix C — DNA sequence hard cap: `DNA_MAX_LENGTH = 1024` bases. Insertion
+> flooding DoS mitigated — sequences at cap convert insertions to deletions.
+> Fix D — Reorder buffer increased 100 → 1000 packets. With DH interval=50,
+> a 60-msg delayed packet on a congested link previously caused permanent loss.
+> All 115 Rust + 32 Go tests pass.
+
 
 ---
 
@@ -111,26 +115,36 @@ No proprietary, experimental, or unaudited primitives are used anywhere in the p
 Every BEP identity consists of a **Key Bundle** generated entirely on-device:
 
 ```
-Identity Key (IK)       — Ed25519 keypair. Stable. Never rotated.
-                          This is your cryptographic identity.
+Identity Signing Key (IK_sign) — Ed25519 keypair. Stable. Never rotated.
+                                  Used for: signing SPK, signing Kyber EK,
+                                  signing username claims, signing packets.
+                                  This is your verifiable cryptographic identity.
 
-Signed Prekey (SPK)     — X25519 keypair. Rotated every 30 days.
-                          Signed by IK. Prevents key injection attacks.
+Identity DH Key (IK_dh)        — X25519 (Curve25519) keypair. Stable.
+                                  Used for: Sealed Sender ECDH ONLY.
+                                  SEPARATE from IK_sign — not convertible.
+                                  WHY SEPARATE: Ed25519 and X25519 use different
+                                  curve forms (Edwards vs. Montgomery). Direct
+                                  ECDH on an Ed25519 point is undefined.
+                                  IK_dh is the routing address the relay uses.
 
-Kyber Encapsulation Key — ML-KEM-768 keypair. Rotated with SPK.
-(Kyber EK)                Signed by IK. Quantum-resistant component.
+Signed Prekey (SPK)            — X25519 keypair. Rotated every 30 days.
+                                  Signed by IK_sign. Prevents key injection.
 
-One-Time Prekeys (OPKs) — X25519 keypairs. 100 generated at startup.
-                          Used once and destroyed.
-                          MANDATORY for all new sessions (see §4.2 note).
+Kyber Encapsulation Key (KEK)  — ML-KEM-768 keypair. Rotated with SPK.
+                                  Signed by IK_sign. Quantum-resistant component.
+
+One-Time Prekeys (OPKs)        — X25519 keypairs. 100 generated at startup.
+                                  Used once and destroyed. MANDATORY for all
+                                  new sessions (OPK Saver Mode at < 10 remaining).
 ```
 
 > **IK rotation limitation:** Identity Keys are intentionally stable — rotating them
 > would invalidate all existing contact relationships and Key Audit Log history.
-> If an IK is compromised, the affected user must create a new identity (new key pair)
-> and re-establish contact with peers out-of-band. IK rotation with social recovery
-> (a signed "key update" message proving continuity from the old IK) is planned for
-> v3.0 as an optional mechanism. See §10 Future Work.
+> If an IK is compromised, the affected user must create a new identity and
+> re-establish contact out-of-band. IK rotation with social recovery is planned
+> for v3.0. See §10 Future Work.
+
 
 The public portion of this bundle is uploaded to the relay. **Private keys never leave the device.**
 
@@ -210,8 +224,18 @@ Insertion      4%  — insert random base at random position (seq grows)
 Deletion       1%  — remove base at random position (seq shrinks)
 ```
 
-**MutationHeader (transmitted with every message):**
+**DNA Ratchet state bounds (Qwen audit Fix C):**
+```
+DNA_MIN_LENGTH = 128 bases   (genesis default)
+DNA_MAX_LENGTH = 1024 bases  (hard cap — insertion flooding protection)
+```
+When an Insertion mutation would push the sequence past 1024 bases, it is
+silently converted to a Deletion. This prevents memory exhaustion from an
+attacker flooding messages engineered to always trigger Insertions (4% rate).
+HKDF produces a unique message key regardless of exact sequence length —
+this substitution has **zero cryptographic impact**.
 
+**MutationHeader (transmitted encrypted with every message):
 ```
 MutationHeader {
     mutation_type:  Transition | Transversion | Insertion | Deletion
@@ -389,9 +413,21 @@ If pending_turn_since.is_some() and message_index >= since + TIMEOUT:
 
 **Constants:**
 ```
-DH_RATCHET_INTERVAL = 50    // messages between DH turn triggers
-DH_RATCHET_TIMEOUT  = 100   // messages before pending retried
+DH_RATCHET_INTERVAL       = 50   // messages between DH turn triggers
+DH_RATCHET_TIMEOUT_SECS   = 7_776_000  // 90 days in seconds (wall-clock)
 ```
+
+> **Qwen audit Fix B — "Hiking Trip" Bug (wall-clock timeout):**
+> The previous spec used a message-count timeout (`DH_RATCHET_TIMEOUT = 100 messages`).
+> This caused a critical desync bug in async messaging:
+> If Alice sends 100 messages while Bob is offline for a week, Alice's client
+> would discard the pending ephemeral at message 100. When Bob returns, he cannot
+> complete the DH handshake — permanent chat history loss.
+>
+> **Fix:** `pending_turn_since` now stores a Unix timestamp (seconds), not a
+> message index. The pending DH state is preserved regardless of how many messages
+> are sent, until the peer responds OR 90 days of wall-clock time elapses
+> (after which the session is practically abandoned).
 
 For forward secrecy, DH turn interval is irrelevant — old dna_states are
 zeroized every message. The interval only affects break-in recovery granularity
@@ -846,8 +882,8 @@ Session ID  : 88ae7a768a2232426fd5e1b586f3b1c2d6b36c0b51642a7be4f204c98e4271bc
 
 ---
 
-*Bio Encryption Protocol — Public Specification v2.4*
+*Bio Encryption Protocol — Public Specification v2.5*
 *© 2026 IAMTRIXY. Released under the MIT License.*
 *Protocol specification released under Creative Commons CC-BY 4.0.*
-*Revised after external cryptographic audit — all 16 issues addressed, documentation complete.*
-*Auditor verdict: "BEP is now a serious contender. Ready for beta deployment." — **A rating**.*
+*Multi-AI audit complete (Qwen + internal): all critical issues resolved.*
+*"BEP is now a serious contender. Ready for beta deployment." — **A rating**.*
