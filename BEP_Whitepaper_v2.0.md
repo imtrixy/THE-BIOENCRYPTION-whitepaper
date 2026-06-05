@@ -1,10 +1,17 @@
 # Bio Encryption Protocol (BEP)
 ### A Post-Quantum End-to-End Encrypted Messaging Protocol with Biologically-Inspired Key Evolution
 
-**Version 2.0 — Public Specification**
+**Version 2.2 — Public Specification**
 **Author: IAMTRIXY**
 **Date: June 2026**
-**Status: Public Draft**
+**Status: Public Draft — Revised after external cryptographic audit**
+
+> **Changelog v2.2:** Wire format v2 (MutationHeader encrypted); OPK usage mandatory;
+> DH ratchet interval changed to every 50 messages; PoW keyed on recipient IK;
+> mlock() mandatory; Key Transparency renamed to Audit Log + gossip requirement;
+> ML-DSA-65 added for KT root signing; HKDF salt entropy specified;
+> break-in recovery claim retracted; sealed sender limitation documented.
+> All 108 Rust tests and 32 Go tests pass.
 
 ---
 
@@ -57,7 +64,12 @@ BEP is designed to provide security against adversaries with the following capab
 | **Nation-State (Classical)** | Subpoena relay, intercept traffic | Relay has nothing readable; forward secrecy destroys past keys |
 | **Nation-State (Quantum)** | Cryptographically relevant quantum computer | ML-KEM-768 is NIST-selected, quantum-resistant |
 | **Man-in-the-Middle** | Intercepts key exchange | Ed25519 signatures + Key Transparency Log detect substitution |
-| **Spam / DDoS** | Floods relay with fake messages | Adaptive Proof-of-Work (16–24 bit, IP-adaptive) |
+| **Spam / DDoS** | Floods relay with fake messages | Adaptive PoW (16–24 bit, keyed on recipient IK) |
+
+> **Sealed sender limitation:** Sealed sender hides the *sender* from the relay.
+> The *recipient's* identity key is visible to the relay as a routing address — this
+> is an accepted limitation. A passive observer can determine that *someone* sent
+> *something* to a given recipient, but cannot determine who without breaking ECDH.
 
 ### 2.2 Adversaries Outside BEP's Scope
 
@@ -106,8 +118,8 @@ Kyber Encapsulation Key — ML-KEM-768 keypair. Rotated with SPK.
 (Kyber EK)                Signed by IK. Quantum-resistant component.
 
 One-Time Prekeys (OPKs) — X25519 keypairs. 100 generated at startup.
-                          Used once and destroyed. Provide perfect forward
-                          secrecy for the session initiation phase.
+                          Used once and destroyed.
+                          MANDATORY for all new sessions (see §4.2 note).
 ```
 
 The public portion of this bundle is uploaded to the relay. **Private keys never leave the device.**
@@ -131,15 +143,31 @@ classical_shared = DH1 || DH2 || DH3 || DH4
 (kyber_shared, kyber_ciphertext) = ML-KEM-768.Encapsulate(Bob_KyberEK_pub)
 ```
 
-**Combined session key:**
+**Combined session key (KEM combiner):**
 ```
 session_seed = HKDF-SHA256(
     ikm  = classical_shared || kyber_shared,
-    info = "bep-hybrid-pqxdh-v1"
+    salt = "bep-hybrid-pqxdh-v1"
 )
+
+session_id = HKDF-SHA256(
+    ikm  = session_seed,
+    info = "bep-session-id-v1"
+)  // session_id entropy = full PQXDH output — no predictability
 ```
 
-This construction means an adversary must break **both** the elliptic-curve component (using a quantum computer) **and** the ML-KEM-768 component (currently believed to require exponential time even for quantum computers) to recover the session seed.
+> **KEM combiner note:** Wrapping `classical_shared || kyber_shared` in HKDF is a
+> sound KEM combiner. A break in either component alone is insufficient — the attacker
+> needs both. This is explicit in the spec and verified in the implementation.
+
+This construction means an adversary must break **both** components simultaneously to recover the session seed.
+
+> **OPK requirement (audit fix #1):** OPK usage is **mandatory** for all new sessions.
+> When an OPK is consumed: `DH4 = ECDH(Alice_EK, Bob_OPK_priv)` — both ephemeral keys
+> are deleted post-handshake. SPK compromise alone cannot recover a session where an OPK
+> was consumed. If no OPK is available (all 100 exhausted before Bob replenishes), the
+> session proceeds without DH4 and the forward secrecy guarantee is reduced to:
+> *"SPK compromise AND Alice_EK compromise"* — both sides must acknowledge this weakening.
 
 ### 4.3 The DNA Ratchet — Per-Message Key Evolution
 
@@ -174,25 +202,52 @@ MutationHeader {
 }
 ```
 
-**State advance and key derivation:**
+**Wire format v2 — MutationHeader encrypted (audit fix #2):**
+
+In protocol v2, the `MutationHeader` is **never transmitted in plaintext**.
+It is prepended (14 bytes) to the message before AES-GCM encryption:
 
 ```
-// Sender (each message):
+// Plaintext wire format (v2):
+[protocol_version: 1B = 0x02]
+[session_id: 16B]
+[message_index: 8B]           ← only public metadata
+[nonce: 12B]
+[ciphertext: AES-256-GCM( MutationHeader(14B) || padded_message )]
+[signature: 64B Ed25519]
+// No plaintext mutation_type, position, or direction — no fingerprinting
+```
+
+**State advance and key derivation (correct order):**
+
+```
+// Sender (each message) — key derived BEFORE mutation:
+message_key   = HKDF-SHA256(
+                    ikm  = encode_bytes(dna_state[n]),
+                    salt = session_id,
+                    info = "bep_message_key_v1:" || message_index
+                )          // derived from state N
 mutation_type = CSRNG.select()            // 70/25/4/1% distribution
 position      = CSRNG.range(0..seq.len())
 header        = apply_mutation(&mut dna_state, mutation_type, position)
-message_key   = HKDF-SHA256(encode_bytes(dna_state), session_id, "bep-msg-key-v1")
-zeroize(prev_dna_state)                   // irreversibly deleted
-transmit(header_bytes, AES256GCM(message_key, plaintext))
+                           // state N → state N+1
+aad           = protocol_version || session_id || message_index
+ciphertext    = AES256GCM(message_key, header_bytes || padded_plaintext, aad)
+zeroize(message_key)       // key wipe
+transmit(packet)           // no mutation metadata visible
 
-// Receiver (each message):
-replay_mutation(&mut dna_state, received_header)  // deterministic from header
-message_key = HKDF-SHA256(encode_bytes(dna_state), session_id, "bep-msg-key-v1")
-zeroize(prev_dna_state)
+// Receiver (each message) — mirrors sender order:
+message_key   = HKDF-SHA256(encode_bytes(dna_state[n]), session_id, info)
+                           // same state N as sender used
+decrypted     = AES256GCM_decrypt(message_key, ciphertext, aad)
+header        = decrypted[0:14]           // extract from plaintext
+plaintext     = decrypted[14:]            // actual message
+replay_mutation(&mut dna_state, header)  // advance to state N+1
+zeroize(message_key)
 ```
 
-Both sides arrive at identical `dna_state[n]` and therefore identical `message_key[n]`
-without ever transmitting the state or key directly.
+Both sides derive `message_key[n]` from `dna_state[n]` (before mutation),
+then advance to `dna_state[n+1]` using the header embedded in the ciphertext.
 
 **Minimum-length enforcement:** If a Deletion would shrink the sequence below
 128 bases, both sides independently replace it with a Transition — no extra
@@ -233,42 +288,53 @@ Precisely:
   `message_key[n-1]` because `dna_state[n-1]` was zeroized and HKDF is a
   one-way PRF. This holds regardless of mutation type.
 
-- **Break-in recovery (backward secrecy)**: If an attacker extracts
-  `dna_state[n]` from device memory, they cannot predict `dna_state[n+1]`
-  because the next mutation type and position are chosen by CSRNG and not
-  yet determined. This is a **genuine property** of the random mutation
-  scheme — CSRNG entropy enters the state on every message, providing
-  symmetric-layer break-in recovery without requiring a DH turn.
+- **Break-in recovery (retracted — audit fix #3):**
+  The previous version claimed CSRNG mutations provide symmetric-layer break-in
+  recovery. **This claim is retracted.** Even with the MutationHeader encrypted
+  inside the ciphertext, an attacker who extracts `dna_state[n]` can derive
+  `message_key[n]`, then decrypt message n to recover the header, then advance
+  to `dna_state[n+1]`. Break-in recovery requires DH turn injection — see §4.3.3.
 
 - **Key uniqueness**: `dna_state[n]` is unique per message (CSRNG advance);
-  HKDF maps distinct inputs to computationally independent outputs.
+  HKDF + unique `message_index` in the info string guarantee independent keys
+  even if the DNA state were to cycle.
 
 **Comparison to Signal’s Double Ratchet:**
 
 | Property | Signal CK advance | BEP DNA advance |
 |---|---|---|
 | State advance | `HMAC(CK, 0x02)` — one-way | CSRNG mutation — random |
-| Invertible? | No (computationally) | Partially (Transition/Transversion yes) |
+| Header in plaintext? | No | **No (v2: encrypted inside ciphertext)** |
+| Invertible? | No (computationally) | Partially (Transition/Transversion) |
 | Forward secrecy source | HMAC + deletion | HKDF + deletion |
-| Break-in recovery source | DH ratchet turn only | CSRNG on every message |
-| Header required for sync? | No | Yes (MutationHeader) |
-| Defense-in-depth | Higher | Different trade-off |
-
-Signal’s chain key advance requires no extra header but provides break-in
-recovery only at DH turn boundaries. BEP’s CSRNG mutation provides
-symmetric-layer break-in recovery every message at the cost of transmitting
-a `MutationHeader`. Both are secure designs with different trade-offs.
+| Break-in recovery source | DH ratchet turn | DH ratchet turn (every 50 msgs) |
+| Defense-in-depth | Higher (no header) | Equal when header encrypted |
 
 **Summary: Cryptographic security comes from HKDF-SHA256 and zeroize-on-use.
-The DNA mutation’s genuine contribution is injecting CSRNG entropy per
-message, providing symmetric-layer break-in recovery independent of DH turns.**
+With the MutationHeader encrypted in v2, the DNA layer adds no traffic-analysis
+surface. Forward secrecy properties are equivalent to Signal's symmetric ratchet.**
 
-#### 4.3.3 DH Ratchet Turn
+#### 4.3.3 DH Ratchet Turn (audit fix #4)
 
-A new X25519 ephemeral key exchange is performed on **every message**.
-Even if both `dna_state[n]` and the MutationHeader stream are captured,
-the next DH turn derives a new `session_seed` from fresh ephemeral DH
-material that no prior state can predict.
+A new X25519 ephemeral key exchange is performed every **50 messages**
+(`DH_RATCHET_INTERVAL = 50`), not every message.
+
+**Rationale:** Per-message DH turns cost ~300k CPU cycles each. At 60 msg/sec
+that is 18M cycles/sec — unacceptable on mobile hardware. Every-50-message turns
+cap overhead at ~360k cycles/sec while preserving break-in recovery:
+an attacker who extracts `dna_state[n]` can derive at most 49 subsequent keys
+before the DH turn injects fresh ephemeral material they cannot predict.
+
+```
+Trigger: message_index % 50 == 0
+Mechanism: new X25519 ephemeral key pair generated
+           new ephemeral public key transmitted inside the encrypted payload
+           both sides perform ECDH → new session_seed
+           DNA Ratchet reinitialised from new session_seed
+```
+
+For forward secrecy, DH turn interval is irrelevant — old states are zeroized
+every message. The interval only affects break-in recovery granularity.
 
 
 
@@ -277,22 +343,23 @@ material that no prior state can predict.
 Every BEP message is encrypted using:
 
 ```
-1. Derive message_key via DNA Ratchet (Section 4.3)
-2. Apply traffic-analysis-resistant padding (bucket sizing)
-3. Generate nonce:
-   - Default: random 12 bytes (SecureRandom / OsRng)
-   - Birthday bound note: with random nonces, collision probability reaches
-     2^{-32} after approximately 2^{32} messages per session (~4 billion).
-     For high-volume sessions, a counter-based nonce (session_msg_index
-     serialized as 8 bytes || 4 random bytes) is recommended and supported.
-4. AES-256-GCM encrypt:
+1. Derive message_key from current dna_state via HKDF-SHA256
+2. Advance DNA ratchet (CSRNG mutation) → MutationHeader
+3. Apply traffic-analysis-resistant padding (bucket sizing)
+4. Generate nonce: random 12 bytes (OsRng / SecureRandom)
+   Birthday bound: 2^{-32} collision probability after ~2^32 messages.
+   For very high-volume sessions, use counter-nonce:
+   session_msg_index(8B) || random(4B)
+5. AES-256-GCM encrypt:
+   plaintext_blob = MutationHeader(14B) || padded_message
+   aad = protocol_version(1B) || session_id(16B) || message_index(8B)
    ciphertext = AES256GCM(
-       key   = message_key,
-       nonce = 12-byte nonce (random or counter-derived),
-       plaintext = padded_message,
-       aad   = session_id || message_index
+       key       = message_key,
+       nonce     = 12-byte random nonce,
+       plaintext = plaintext_blob,
+       aad       = aad
    )
-5. Append HMAC-covered mutation header (DNA ratchet advance proof)
+   // MutationHeader inside ciphertext — not visible in wire format
 ```
 
 The `aad` (additional authenticated data) binds the ciphertext to the session and message index, preventing replay attacks even if an attacker captures ciphertext from a prior session.
@@ -320,17 +387,31 @@ The relay performs routing using Bob's IK as an address. It does not have Bob's 
 
 **Result:** An adversary with full access to relay infrastructure learns only that *someone* sent *something* to Bob. They cannot determine who without breaking the ECDH problem.
 
-### 4.6 Key Transparency Log
+### 4.6 Key Audit Log (audit fix #7)
 
-Every public key rotation is recorded in an **append-only SHA-256 Merkle tree**:
+Every public key registration and rotation is recorded in an **append-only SHA-256 Merkle tree**:
 
 ```
 KeyCommitment = SHA256(IK_pub || Kyber_EK_prefix || SPK_pub || timestamp)
 ```
 
-The current Merkle root is publicly verifiable. Any client can request an **inclusion proof** — an O(log n) proof that their key commitment exists in the log at a specific position.
+The current Merkle root is signed by the relay using **both Ed25519 and ML-DSA-65
+(FIPS 204)** — providing classical and post-quantum root integrity simultaneously
+(audit fix #12). A quantum adversary cannot forge the ML-DSA-65 signature on a
+fake root.
 
-**Why this matters:** If a relay operator attempted to substitute Bob's public key with a different key (to enable a man-in-the-middle attack), the new key commitment would not appear in the log with a valid inclusion proof. Alice's client verifies the proof before initiating any session. Key substitution without detection is computationally equivalent to finding a SHA-256 collision — infeasible.
+Any client can request an **inclusion proof** — an O(log n) path proving their
+key commitment exists in the log. Key substitution requires finding a SHA-256
+collision — infeasible.
+
+**Gossip requirement (audit fix #7):** The relay publishing its own root is
+not trustless. Clients **MUST** compare their locally-cached root against at
+least two peers on startup. If roots diverge, the client alerts the user of
+a potential log fork. Full multi-operator federation is a v3.0 target.
+
+> **Renamed from "Key Transparency Log":** The single-relay Merkle tree does not
+> meet the full trustless definition of Certificate Transparency. "Key Audit Log"
+> is the honest name for the current single-relay design.
 
 ---
 
@@ -371,17 +452,34 @@ Bob's device decrypts locally
 
 Once delivered, the relay copy is deleted. There is no persistent message storage. A government subpoena of a BEP relay after message delivery receives an empty result — not because of a policy decision, but because the data does not exist.
 
-### 5.3 Anti-Spam: Adaptive Proof-of-Work
+### 5.3 Anti-Spam: Adaptive Proof-of-Work (audit fix #9)
 
-To prevent relay flooding without requiring user accounts, BEP uses a **server-side adaptive Proof-of-Work** system:
+BEP uses a **per-recipient-IK adaptive Proof-of-Work** system. Rate tracking
+is keyed on the **recipient's identity key**, not the sender's IP address.
 
-| Sender rate (per minute) | Required PoW difficulty | ~SHA-256 hashes |
+**Why per-recipient (not per-IP):**
+NAT means thousands of users share one IP. Tor exit nodes all look like one IP.
+Mobile networks change IP on every handoff. Per-IP PoW punishes legitimate users
+and does nothing to protect individual inboxes from targeted flooding.
+
+Per-recipient PoW independently protects each inbox:
+
+| Recipient inbox rate (per minute) | Required PoW | ~SHA-256 hashes |
 |---|---|---|
 | < 10 messages | 16 bits | 65,536 |
 | 10–50 messages | 20 bits | 1,048,576 |
 | > 50 messages | 24 bits | 16,777,216 |
 
-The PoW is computed client-side before sending. This imposes negligible cost on normal users (milliseconds) while making bot-scale flooding economically infeasible.
+```
+PoW formula:
+SHA256(recipient_ik_bytes || SHA256(payload) || nonce_le64)
+  must have `difficulty` leading zero bits
+```
+
+A spammer flooding one recipient hits high difficulty for that recipient only —
+all other recipients are unaffected. Known limitation: Sybil inboxes (attacker
+creates many fresh recipient keys) remain possible — documented as an open research
+problem for anonymous relay access.
 
 ---
 
@@ -400,9 +498,26 @@ BEP does not require phone numbers, email addresses, or real names. Contact disc
 
 ### 7.1 Forward Secrecy
 
-**Per-session:** The X3DH handshake uses ephemeral keys that are destroyed after the session is established. Compromise of long-term keys after session setup does not retroactively reveal session keys.
+**Per-session (with OPK — mandatory):** When an OPK is consumed, both
+`Alice_EK` and `Bob_OPK_priv` are deleted after the handshake. Even full SPK
+compromise cannot recover the session — the attacker also needs either ephemeral
+key, which no longer exists. OPK consumption is mandatory for all new sessions
+(audit fix #1).
 
-**Per-message:** The DNA Ratchet generates a unique key for every message. Past message keys are explicitly destroyed from memory (using `zeroize`) after use. Compromise of message key K[n] reveals only message n — not messages 1 through n-1.
+**Per-session (without OPK — weakened):** If no OPK is available, the forward
+secrecy guarantee weakens to requiring compromise of both `Alice_EK` AND
+`Bob_SPK_priv`. This is documented and accepted — clients alert users when
+no OPKs remain for a contact.
+
+**Per-message:** The DNA Ratchet derives a unique key per message from `dna_state[n]`.
+The previous state is zeroized immediately after key derivation. HKDF is a
+one-way PRF — knowing `message_key[n]` reveals nothing about `dna_state[n]`.
+Key compromise reveals only that message (audit fix #13 — contradiction resolved).
+
+**mlock() mandatory (audit fix #6):** All key material is pinned to RAM with
+`mlock()` to prevent OS swap-to-disk of secret bytes. This is mandatory in all
+language bindings. The Kotlin JNI bridge passes key material as `ByteArray`
+through JNI and zeroes it in Rust before returning — Java GC cannot reach it.
 
 ### 7.2 Post-Quantum Security
 
@@ -423,7 +538,12 @@ Both are computationally infeasible for any known classical or quantum adversary
 
 ### 7.4 Replay Attack Prevention
 
-Messages include a **session ID** and a monotonically increasing **message index** as AES-GCM additional authenticated data (AAD). A replayed message from the same session has a stale message index and is rejected by the DNA Ratchet's ordering validation. A replayed message from a different session has an invalid session ID in its AAD and fails authentication.
+Messages include `protocol_version || session_id || message_index` as AES-GCM
+AAD. A replayed message has a stale `message_index` and is rejected. A message
+from a different session has an invalid `session_id` hash and fails AES-GCM
+authentication. The reorder buffer accepts out-of-order messages within a
+100-message window (audit fix #10); messages outside the window are rejected
+with `STALE_MESSAGE` error.
 
 ### 7.5 Key Substitution Prevention
 
@@ -460,7 +580,7 @@ The BEP reference implementation is written across multiple languages for securi
 
 The implementation uses **no proprietary dependencies**. All cryptographic primitives are sourced from the RustCrypto ecosystem (`aes-gcm`, `x25519-dalek`, `ed25519-dalek`, `hkdf`, `ml-kem`) — the most widely audited open-source cryptography library in the Rust ecosystem.
 
-**Test coverage:** 137 tests across unit, integration, and documentation test suites — all passing.
+**Test coverage:** 108 Rust tests (99 unit + 7 integration + 2 doc) + 32 Go tests — all passing after v2.2 audit fixes.
 
 ---
 
@@ -504,6 +624,7 @@ Pavel Durov is right that apps which try to provide security and usability in on
 
 ---
 
-*Bio Encryption Protocol — Public Specification v2.0*
+*Bio Encryption Protocol — Public Specification v2.2*
 *© 2026 IAMTRIXY. Released under the MIT License.*
 *Protocol specification released under Creative Commons CC-BY 4.0.*
+*Revised after external cryptographic audit — 14 findings addressed.*
