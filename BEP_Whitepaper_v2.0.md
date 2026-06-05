@@ -143,51 +143,156 @@ This construction means an adversary must break **both** the elliptic-curve comp
 
 ### 4.3 The DNA Ratchet — Per-Message Key Evolution
 
-Once a session is established, BEP uses the **DNA Ratchet** for all subsequent messages. Unlike standard double-ratchet constructions, BEP's ratchet keys evolve using rules inspired by biological DNA mutation:
+Once a session is established, BEP uses the **DNA Ratchet** for all subsequent messages.
 
-**DNA Encoding:** Encryption key bytes are mapped to DNA bases:
-```
-00 → A (Adenine)
-01 → T (Thymine)
-10 → G (Guanine)
-11 → C (Cytosine)
-```
+#### 4.3.1 Formal Definition
 
-**Mutation rules (applied per message):**
-```
-Transitions  (same class, different base):  A↔G, T↔C
-Transversions (cross class):               A↔T, A↔C, G↔T, G↔C
-```
+The DNA Ratchet state is a variable-length sequence of bases `{A, T, G, C}`,
+initalized from the PQXDH session seed. On each message the sender applies a
+**CSRNG-chosen mutation**, records it in a `MutationHeader`, and sends the
+header alongside the ciphertext so the receiver can replay the identical state advance.
 
-Each message applies a mutation to the key sequence, then derives the actual AES-256 message key:
+**Mutation types (selected by CSRNG each message):**
+
 ```
-dna_key[n+1]  = mutate(dna_key[n], message_index)
-message_key   = HKDF-SHA256(decode_dna(dna_key[n+1]), session_id, "bep-msg-key-v1")
+Transition    70%  — same-class swap:    A↔G, C↔T
+Transversion  25%  — cross-class swap:   A↔{C,T}, G↔{C,T}
+Insertion      4%  — insert random base at random position (seq grows)
+Deletion       1%  — remove base at random position (seq shrinks)
 ```
 
-**Properties:**
-- Keys are unique per message — no two messages share a key
-- Past keys are destroyed after use — forward secrecy across every message, not just sessions
-- The mutation sequence is deterministic but not reversible without the seed — an attacker who learns message key K[n] cannot derive K[n-1]
-- The DNA encoding adds a layer of obfuscation that departs from standard binary key representations
+**MutationHeader (transmitted with every message):**
 
-**DH ratchet turn:** Every N messages (configurable, default: every message), a new X25519 DH exchange is also performed, providing the "healing" property — even if a message key is somehow extracted, the next DH turn resets the ratchet to a state the attacker cannot predict.
+```
+MutationHeader {
+    mutation_type:  Transition | Transversion | Insertion | Deletion
+    position:       usize           // which base was affected
+    direction:      ToBase(u8)      // Transition/Transversion: result base
+                  | Inserted(u8)   // Insertion: base that was inserted
+                  | Deleted        // Deletion: marker only
+    message_index:  u64            // monotonic counter — replay guard
+}
+```
+
+**State advance and key derivation:**
+
+```
+// Sender (each message):
+mutation_type = CSRNG.select()            // 70/25/4/1% distribution
+position      = CSRNG.range(0..seq.len())
+header        = apply_mutation(&mut dna_state, mutation_type, position)
+message_key   = HKDF-SHA256(encode_bytes(dna_state), session_id, "bep-msg-key-v1")
+zeroize(prev_dna_state)                   // irreversibly deleted
+transmit(header_bytes, AES256GCM(message_key, plaintext))
+
+// Receiver (each message):
+replay_mutation(&mut dna_state, received_header)  // deterministic from header
+message_key = HKDF-SHA256(encode_bytes(dna_state), session_id, "bep-msg-key-v1")
+zeroize(prev_dna_state)
+```
+
+Both sides arrive at identical `dna_state[n]` and therefore identical `message_key[n]`
+without ever transmitting the state or key directly.
+
+**Minimum-length enforcement:** If a Deletion would shrink the sequence below
+128 bases, both sides independently replace it with a Transition — no extra
+sync needed.
+
+#### 4.3.2 Key Derivation
+
+Each message key is derived as follows:
+
+```
+dna_state[0]   = session_seed[0:32]          // initialized from PQXDH
+dna_state[n+1] = mutate(dna_state[n], n)     // state advance (bijection)
+message_key[n] = HKDF-SHA256(
+    ikm  = dna_state[n],
+    salt = session_id,
+    info = "bep-msg-key-v1"
+)
+zeroize(dna_state[n])                        // delete after key derivation
+```
+
+#### 4.3.2 Security Analysis — What the DNA Layer Does and Does Not Provide
+
+> **Important note for cryptographic reviewers:**
+>
+> The mutation step is **not a one-way function**. Transitions and transversions
+> are self-inverse. The `MutationHeader` is transmitted with each message, so
+> an observer who captures the header knows what mutation was applied.
+> Deletion provides partial state loss (deleted base is unrecoverable from the
+> new state alone), but this is not a primary security claim.
+>
+> **All forward secrecy and key uniqueness guarantees derive entirely from
+> HKDF-SHA256** as a pseudorandom function, combined with **zeroize-on-use**
+> of the previous `dna_state` after each key derivation.
+
+Precisely:
+
+- **Forward secrecy**: An attacker who learns `message_key[n]` cannot recover
+  `message_key[n-1]` because `dna_state[n-1]` was zeroized and HKDF is a
+  one-way PRF. This holds regardless of mutation type.
+
+- **Break-in recovery (backward secrecy)**: If an attacker extracts
+  `dna_state[n]` from device memory, they cannot predict `dna_state[n+1]`
+  because the next mutation type and position are chosen by CSRNG and not
+  yet determined. This is a **genuine property** of the random mutation
+  scheme — CSRNG entropy enters the state on every message, providing
+  symmetric-layer break-in recovery without requiring a DH turn.
+
+- **Key uniqueness**: `dna_state[n]` is unique per message (CSRNG advance);
+  HKDF maps distinct inputs to computationally independent outputs.
+
+**Comparison to Signal’s Double Ratchet:**
+
+| Property | Signal CK advance | BEP DNA advance |
+|---|---|---|
+| State advance | `HMAC(CK, 0x02)` — one-way | CSRNG mutation — random |
+| Invertible? | No (computationally) | Partially (Transition/Transversion yes) |
+| Forward secrecy source | HMAC + deletion | HKDF + deletion |
+| Break-in recovery source | DH ratchet turn only | CSRNG on every message |
+| Header required for sync? | No | Yes (MutationHeader) |
+| Defense-in-depth | Higher | Different trade-off |
+
+Signal’s chain key advance requires no extra header but provides break-in
+recovery only at DH turn boundaries. BEP’s CSRNG mutation provides
+symmetric-layer break-in recovery every message at the cost of transmitting
+a `MutationHeader`. Both are secure designs with different trade-offs.
+
+**Summary: Cryptographic security comes from HKDF-SHA256 and zeroize-on-use.
+The DNA mutation’s genuine contribution is injecting CSRNG entropy per
+message, providing symmetric-layer break-in recovery independent of DH turns.**
+
+#### 4.3.3 DH Ratchet Turn
+
+A new X25519 ephemeral key exchange is performed on **every message**.
+Even if both `dna_state[n]` and the MutationHeader stream are captured,
+the next DH turn derives a new `session_seed` from fresh ephemeral DH
+material that no prior state can predict.
+
+
 
 ### 4.4 Message Encryption
 
 Every BEP message is encrypted using:
 
 ```
-1. Derive message_key via DNA Ratchet (above)
+1. Derive message_key via DNA Ratchet (Section 4.3)
 2. Apply traffic-analysis-resistant padding (bucket sizing)
-3. AES-256-GCM encrypt:
+3. Generate nonce:
+   - Default: random 12 bytes (SecureRandom / OsRng)
+   - Birthday bound note: with random nonces, collision probability reaches
+     2^{-32} after approximately 2^{32} messages per session (~4 billion).
+     For high-volume sessions, a counter-based nonce (session_msg_index
+     serialized as 8 bytes || 4 random bytes) is recommended and supported.
+4. AES-256-GCM encrypt:
    ciphertext = AES256GCM(
        key   = message_key,
-       nonce = random 12 bytes,
+       nonce = 12-byte nonce (random or counter-derived),
        plaintext = padded_message,
        aad   = session_id || message_index
    )
-4. Append HMAC-covered mutation header (DNA ratchet advance proof)
+5. Append HMAC-covered mutation header (DNA ratchet advance proof)
 ```
 
 The `aad` (additional authenticated data) binds the ciphertext to the session and message index, preventing replay attacks even if an attacker captures ciphertext from a prior session.
