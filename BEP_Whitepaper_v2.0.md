@@ -1,21 +1,23 @@
 # Bio Encryption Protocol (BEP)
 ### A Post-Quantum End-to-End Encrypted Messaging Protocol with Biologically-Inspired Key Evolution
 
-**Version 2.5 — Public Specification**
+**Version 2.6 — Public Specification**
 **Author: IAMTRIXY**
 **Date: June 2026**
-**Status: Public Draft — Ready for formal verification and beta deployment**
+**Status: Public Draft — Beta-ready. Formal verification + third-party audit pending.**
 
-> **Changelog v2.5 (Qwen AI audit fixes):**
-> Fix A — Dual Identity Key structure explicitly documented: IK\_sign (Ed25519)
-> and IK\_dh (X25519) are separate keys. Sealed Sender uses IK\_dh, not IK\_sign.
-> Fix B — DH Ratchet timeout changed from message count (100 msgs) to wall-clock
-> time (90 days). Eliminates the "Hiking Trip" desync bug.
-> Fix C — DNA sequence hard cap: `DNA_MAX_LENGTH = 1024` bases. Insertion
-> flooding DoS mitigated — sequences at cap convert insertions to deletions.
-> Fix D — Reorder buffer increased 100 → 1000 packets. With DH interval=50,
-> a 60-msg delayed packet on a congested link previously caused permanent loss.
-> All 115 Rust + 32 Go tests pass.
+> **Changelog v2.6 (ChatGPT + Claude audit fixes):**
+> Abstract claim language made precise (ChatGPT recommendation).
+> DNA Ratchet repositioned as "key evolution framework" — no longer claimed as
+> independent security primitive (ChatGPT / all three AI auditors agree).
+> Signal comparison table corrected: Signal also deletes after delivery —
+> distinction is subpoena resistance architecture, not storage policy (Claude).
+> Reorder buffer forward secrecy tradeoff explicitly acknowledged in §7.1 (Claude).
+> Gossip bootstrap peer list specified (Claude).
+> mlock() platform reality documented per OS (Claude).
+> TTL UX guidance added to §5.2 (Claude).
+> TV-7: DNA mutation apply/replay round-trip test vector added (Claude).
+> Formal verification and third-party audit added to roadmap with priority **HIGH**.
 
 
 ---
@@ -26,9 +28,9 @@
 
 ## Abstract
 
-The Bio Encryption Protocol (BEP) is a cryptographic messaging protocol designed to provide security guarantees that exceed those of any currently deployed messaging system. BEP introduces a **DNA Ratchet** — a biologically-inspired key evolution mechanism that mutates encryption keys after every message using rules derived from DNA base-pair transitions. Combined with the NIST-standardized **ML-KEM-768** post-quantum key encapsulation algorithm, **X25519 ECDH**, **Ed25519 digital signatures**, **ECIES Sealed Sender** metadata protection, and an append-only **Merkle-tree key transparency log**, BEP provides forward secrecy, post-quantum security, sender anonymity, and cryptographic auditability in a single unified protocol.
+The Bio Encryption Protocol (BEP) is a cryptographic messaging protocol that **combines post-quantum security, metadata protection, and key transparency in a single unified protocol.** BEP introduces a **DNA Ratchet** — a biologically-inspired key evolution framework that evolves session state after every message using rules derived from DNA base-pair transitions. Combined with the NIST-standardized **ML-KEM-768** post-quantum key encapsulation algorithm, **X25519 ECDH**, **Ed25519 digital signatures**, **ECIES Sealed Sender** metadata protection, and an append-only **Merkle-tree key transparency log**, BEP provides forward secrecy, post-quantum security, sender anonymity, and cryptographic auditability in a single unified protocol.
 
-BEP makes one central claim: **even a nation-state adversary who seizes all relay infrastructure, intercepts all network traffic, and possesses a cryptographically relevant quantum computer cannot read messages, identify senders, or forge keys** — all simultaneously.
+BEP's central security claim: **within the stated threat model, a nation-state adversary who seizes all relay infrastructure, intercepts all network traffic, and possesses a cryptographically relevant quantum computer is designed to face computationally infeasible barriers to reading messages, identifying senders, or forging keys.**
 
 ---
 
@@ -683,15 +685,32 @@ secrecy guarantee weakens to requiring compromise of both `Alice_EK` AND
 `Bob_SPK_priv`. This is documented and accepted — clients alert users when
 no OPKs remain for a contact.
 
-**Per-message:** The DNA Ratchet derives a unique key per message from `dna_state[n]`.
+**Per-message:** The DNA Ratchet evolves session state via a unique key per message derived from `dna_state[n]`.
 The previous state is zeroized immediately after key derivation. HKDF is a
 one-way PRF — knowing `message_key[n]` reveals nothing about `dna_state[n]`.
 Key compromise reveals only that message (audit fix #13 — contradiction resolved).
 
-**mlock() mandatory (audit fix #6):** All key material is pinned to RAM with
-`mlock()` to prevent OS swap-to-disk of secret bytes. This is mandatory in all
-language bindings. The Kotlin JNI bridge passes key material as `ByteArray`
-through JNI and zeroes it in Rust before returning — Java GC cannot reach it.
+> **Reorder buffer forward secrecy tradeoff (Claude audit):** The reorder buffer
+> holds up to 1000 encrypted packets pending gap-fill. While buffered packets are
+> ciphertext-only (the session ratchet state is NOT held frozen for each buffered
+> message — the header-driven replay design means the receiver advances state
+> sequentially as gaps fill), the current session state in memory represents a
+> forward secrecy window equal to the depth of the buffer at the time of compromise.
+> Clients requiring stricter forward secrecy can reduce `MAX_REORDER_BUFFER` at
+> the cost of higher message-loss probability on congested networks.
+
+**mlock() per-platform reality (Claude audit):**
+
+| Platform | Implementation | Fallback |
+|---|---|---|
+| **Linux / Android** | `mlock()` via POSIX. Android kernel allows it for foreground processes. Under extreme memory pressure, `mlock()` may silently fail — `zeroize` still wipes keys before free. | `zeroize` (software wipe) |
+| **Windows** | `VirtualLock()` equivalent. Supported. | `zeroize` |
+| **iOS** | `mlock()` is restricted for third-party apps by iOS memory limits. **Use iOS Secure Enclave / Keychain** with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. This achieves the same "never hits unencrypted disk" guarantee natively. | iOS Keychain |
+| **macOS** | `mlock()` supported with entitlement. | `zeroize` |
+
+> The v2.6 implementation mandates `zeroize` everywhere. `mlock()` is a
+> best-effort enhancement. Where it is unavailable, `zeroize` ensures keys
+> are overwritten before memory is returned to the OS.
 
 ### 7.2 Post-Quantum Security
 
@@ -737,9 +756,15 @@ Any attempt to substitute a relay user's public key is detectable via the Key Tr
 | No phone number required | ❌ | ❌ | ❌ | ✅ |
 | RAM-pinned key storage (mlock) | ❌ | ❌ | ❌ | ✅ |
 | Adaptive PoW spam protection | ❌ | ❌ | ❌ | ✅ |
-| Zero server-side message storage after delivery | ❌ | ❌ | ❌ | ✅ |
+| Zero server-side message storage after delivery | ✅ (deletes on delivery) | ❌ | ❌ | ✅ |
 | Quantum-signed prekeys | ❌ | ❌ | ❌ | ✅ |
 | Open source protocol specification | ✅ | ❌ | ✅ (MTProto) | ✅ |
+
+> **Claude audit correction (v2.6):** Signal also deletes messages server-side after delivery.
+> The meaningful distinction is **subpoena resistance architecture**: Signal operates under
+> US legal jurisdiction and could be compelled to retain metadata. BEP's relay stores only
+> opaque encrypted blobs with no sender identity — even under legal compulsion, the relay
+> operator has nothing useful to disclose.
 
 ---
 
@@ -754,9 +779,9 @@ The BEP reference implementation is written across multiple languages for securi
 
 The implementation uses **no proprietary dependencies**. All cryptographic primitives are sourced from the RustCrypto ecosystem (`aes-gcm`, `x25519-dalek`, `ed25519-dalek`, `hkdf`, `ml-kem`) — the most widely audited open-source cryptography library in the Rust ecosystem.
 
-**Test coverage:** 115 Rust tests (106 unit + 7 integration + 2 doc + 1 ignored) + 32 Go tests — all passing after v2.4 fixes.
+**Test coverage:** 115 Rust tests (106 unit + 7 integration + 2 doc + 1 ignored) + 32 Go tests — all passing.
 
-**Test vectors:** See Appendix A for known-answer tests covering HKDF key derivation, DNA encoding, counter-nonce, and AES-256-GCM encryption with fixed inputs.
+**Test vectors:** See Appendix A for 7 known-answer tests including DNA mutation apply/replay round-trip (TV-7).
 
 ---
 
@@ -866,6 +891,31 @@ Info        : "bep-session-id-v1"
 Session ID  : 88ae7a768a2232426fd5e1b586f3b1c2d6b36c0b51642a7be4f204c98e4271bc
 ```
 
+### TV-7: DNA Mutation Apply/Replay Round-Trip (Claude audit)
+
+This is the **interop-critical** vector. Rust and Go/Kotlin must produce identical
+states for the same `MutationHeader` sequence or sessions will silently desync.
+Fixed `StdRng` seed guarantees deterministic output across all platforms.
+
+```
+CSRNG        : rand::rngs::StdRng  seed=0xBEEFCAFEDEAD1234
+Start state  : ACGTACGT  (8 bases)
+
+Msg 1: type=Transition   pos=1  dir=ToBase(3)  after=ATGTACGT
+Msg 2: type=Transversion pos=6  dir=ToBase(3)  after=ATGTACTT
+Msg 3: type=Transversion pos=3  dir=ToBase(2)  after=ATGGACTT
+Msg 4: type=Transition   pos=2  dir=ToBase(0)  after=ATAGACTT
+Msg 5: type=Transition   pos=7  dir=ToBase(1)  after=ATAGACTC
+
+Final (apply) : ATAGACTC
+Final (replay): ATAGACTC
+Round-trip    : PASS
+
+Base encoding: A=0, C=1, G=2, T=3
+```
+
+*Regenerate: `cargo run --example generate_vectors` in `bioencrypt-core/`*
+
 ---
 
 ## References
@@ -882,8 +932,9 @@ Session ID  : 88ae7a768a2232426fd5e1b586f3b1c2d6b36c0b51642a7be4f204c98e4271bc
 
 ---
 
-*Bio Encryption Protocol — Public Specification v2.5*
+*Bio Encryption Protocol — Public Specification v2.6*
 *© 2026 IAMTRIXY. Released under the MIT License.*
 *Protocol specification released under Creative Commons CC-BY 4.0.*
-*Multi-AI audit complete (Qwen + internal): all critical issues resolved.*
-*"BEP is now a serious contender. Ready for beta deployment." — **A rating**.*
+*Multi-AI audit: Qwen AI (A-), Claude AI (A-), ChatGPT (8.3/10). All critical issues resolved.*
+*"BEP is a serious protocol proposal, not a hobbyist crypto design." — ChatGPT*
+*"Ready for beta deployment." — Qwen AI*
